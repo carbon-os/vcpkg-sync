@@ -83,17 +83,7 @@ func run(cfg Config) error {
 		return nil
 	}
 
-	// 6. Open the registry repo
-	repo, err := openRepo(cfg.RegistryDir)
-	if err != nil {
-		return err
-	}
-	sig, err := repoSignature(repo)
-	if err != nil {
-		return err
-	}
-
-	// 7. Write port files
+	// 6. Write port files
 	fmt.Println("→ writing port files")
 	if isNew {
 		// Create directory tree
@@ -125,7 +115,7 @@ func run(cfg Config) error {
 		}
 	}
 
-	// 8. Update baseline.json
+	// 7. Update baseline.json
 	var baseline BaselineManifest
 	if err := readJSON(baselineAbs(cfg.RegistryDir), &baseline); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -138,27 +128,26 @@ func run(cfg Config) error {
 		return err
 	}
 
-	// 9. Commit port files + baseline — we derive the tree hash from this commit
+	// 8. Commit port files + baseline — we derive the tree hash from this commit
 	fmt.Println("→ committing port files")
 	portCommit, err := stageAndCommit(
-		repo,
+		cfg.RegistryDir,
 		[]string{portfileRel(portName), vcpkgJSONRel(portName), baselineRel()},
 		fmt.Sprintf("chore(vcpkg-sync): update port %s → %s", portName, newVer),
-		sig,
 	)
 	if err != nil {
 		return err
 	}
 
-	// 10. Derive the port directory tree hash from that commit
+	// 9. Derive the port directory tree hash from that commit
 	fmt.Println("→ deriving port tree hash")
-	treeHash, err := subtreeHash(repo, portCommit, portName)
+	treeHash, err := subtreeHash(cfg.RegistryDir, portCommit, portName)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("  tree: %s\n", treeHash)
 
-	// 11. Update version manifest
+	// 10. Update version manifest
 	fmt.Println("→ updating version manifest")
 	var manifest VersionManifest
 	if !isNew {
@@ -174,26 +163,25 @@ func run(cfg Config) error {
 		return err
 	}
 
-	// 12. Commit version manifest separately
+	// 11. Commit version manifest separately
 	if _, err := stageAndCommit(
-		repo,
+		cfg.RegistryDir,
 		[]string{versionFileRel(portName)},
 		fmt.Sprintf("chore(vcpkg-sync): version manifest %s → %s", portName, newVer),
-		sig,
 	); err != nil {
 		return err
 	}
 
-	// 13. Push
+	// 12. Push
 	if !cfg.NoPush {
 		fmt.Println("→ pushing")
-		if err := push(repo, cfg.Verbose); err != nil {
+		if err := push(cfg.RegistryDir, cfg.Verbose); err != nil {
 			return err
 		}
 	}
 
-	// 14. Print vcpkg-configuration.json snippet
-	head, err := headCommitHash(repo)
+	// 13. Print vcpkg-configuration.json snippet
+	head, err := headCommitHash(cfg.RegistryDir)
 	if err != nil {
 		return err
 	}

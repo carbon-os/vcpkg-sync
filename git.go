@@ -1,161 +1,83 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
-	"io"
 	"os"
-	"time"
-
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
-	gossh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
-	"github.com/go-git/go-git/v5/storage/memory"
+	"os/exec"
+	"strings"
 )
 
+// runGit is a helper to run local git commands and capture stdout.
+func runGit(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
 // resolveRemoteHEAD returns the commit hash HEAD resolves to on the remote.
-// No local clone is required.
 func resolveRemoteHEAD(url string) (string, error) {
-	rem := gogit.NewRemote(memory.NewStorage(), &config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{url},
-	})
-	refs, err := rem.List(&gogit.ListOptions{})
+	cmd := exec.Command("git", "ls-remote", url, "HEAD")
+	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("ls-remote %s: %w", url, err)
+		return "", fmt.Errorf("git ls-remote %s: %w", url, err)
 	}
-
-	lookup := make(map[plumbing.ReferenceName]plumbing.Hash, len(refs))
-	var headTarget plumbing.ReferenceName
-
-	for _, r := range refs {
-		if r.Name() == plumbing.HEAD {
-			if r.Type() == plumbing.SymbolicReference {
-				headTarget = r.Target()
-			} else if !r.Hash().IsZero() {
-				return r.Hash().String(), nil // direct HEAD hash
-			}
-		} else if !r.Hash().IsZero() {
-			lookup[r.Name()] = r.Hash()
-		}
+	
+	// Output format: <hash>\tHEAD\n
+	fields := strings.Fields(string(out))
+	if len(fields) < 1 {
+		return "", fmt.Errorf("cannot resolve HEAD for %s", url)
 	}
-
-	// HEAD was symbolic — follow the target
-	if headTarget != "" {
-		if h, ok := lookup[headTarget]; ok {
-			return h.String(), nil
-		}
-	}
-
-	// Fallback: prefer main, then master
-	for _, name := range []plumbing.ReferenceName{"refs/heads/main", "refs/heads/master"} {
-		if h, ok := lookup[name]; ok {
-			return h.String(), nil
-		}
-	}
-
-	return "", fmt.Errorf("cannot resolve HEAD for %s", url)
-}
-
-// openRepo opens the git repository rooted at path.
-func openRepo(path string) (*gogit.Repository, error) {
-	repo, err := gogit.PlainOpen(path)
-	if err != nil {
-		return nil, fmt.Errorf("open repo at %s: %w", path, err)
-	}
-	return repo, nil
-}
-
-// repoSignature builds a commit signature from the repo's git config,
-// falling back to a vcpkg-sync identity if not set.
-func repoSignature(repo *gogit.Repository) (*object.Signature, error) {
-	cfg, err := repo.Config()
-	if err != nil {
-		return nil, fmt.Errorf("read git config: %w", err)
-	}
-	name, email := cfg.User.Name, cfg.User.Email
-	if name == "" {
-		name = "vcpkg-sync"
-	}
-	if email == "" {
-		email = "vcpkg-sync@noreply"
-	}
-	return &object.Signature{Name: name, Email: email, When: time.Now()}, nil
+	return fields[0], nil
 }
 
 // stageAndCommit stages relPaths (relative to repo root) and creates a commit.
-func stageAndCommit(repo *gogit.Repository, relPaths []string, message string, sig *object.Signature) (plumbing.Hash, error) {
-	w, err := repo.Worktree()
-	if err != nil {
-		return plumbing.ZeroHash, err
+func stageAndCommit(repoDir string, relPaths []string, message string) (string, error) {
+	args := append([]string{"add"}, relPaths...)
+	if _, err := runGit(repoDir, args...); err != nil {
+		return "", err
 	}
-	for _, p := range relPaths {
-		if _, err := w.Add(p); err != nil {
-			return plumbing.ZeroHash, fmt.Errorf("git add %s: %w", p, err)
-		}
+	if _, err := runGit(repoDir, "commit", "-m", message); err != nil {
+		return "", err
 	}
-	h, err := w.Commit(message, &gogit.CommitOptions{
-		Author:    sig,
-		Committer: sig,
-	})
-	if err != nil {
-		return plumbing.ZeroHash, fmt.Errorf("git commit: %w", err)
-	}
-	return h, nil
+	return headCommitHash(repoDir)
 }
 
 // subtreeHash returns the git tree hash of ports/<portName>/ at the given commit.
-// This is the value vcpkg stores in the version manifest.
-func subtreeHash(repo *gogit.Repository, commitHash plumbing.Hash, portName string) (string, error) {
-	commit, err := repo.CommitObject(commitHash)
-	if err != nil {
-		return "", fmt.Errorf("resolve commit %s: %w", commitHash, err)
-	}
-	root, err := commit.Tree()
-	if err != nil {
-		return "", fmt.Errorf("get commit tree: %w", err)
-	}
-	sub, err := root.Tree(portTreePath(portName))
-	if err != nil {
-		return "", fmt.Errorf("find port subtree %s: %w", portTreePath(portName), err)
-	}
-	return sub.Hash.String(), nil
+func subtreeHash(repoDir string, commitHash string, portName string) (string, error) {
+	// git rev-parse <commit>:<path> returns the tree hash for a directory
+	path := portTreePath(portName)
+	return runGit(repoDir, "rev-parse", commitHash+":"+path)
 }
 
-// push pushes to origin, retrying with SSH agent auth on failure.
-func push(repo *gogit.Repository, verbose bool) error {
-	var progress io.Writer
+// push pushes the current branch to origin.
+func push(repoDir string, verbose bool) error {
+	cmd := exec.Command("git", "push", "origin")
+	cmd.Dir = repoDir
+	
 	if verbose {
-		progress = os.Stdout
-	}
-	opts := &gogit.PushOptions{
-		RemoteName: "origin",
-		Progress:   progress,
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
 	}
 
-	err := repo.Push(opts)
-	if err == nil || err == gogit.NoErrAlreadyUpToDate {
-		return nil
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git push: %w\n%s", err, strings.TrimSpace(stderr.String()))
 	}
-
-	// Retry with SSH agent
-	if auth, authErr := gossh.NewSSHAgentAuth("git"); authErr == nil {
-		opts.Auth = auth
-		err = repo.Push(opts)
-		if err == nil || err == gogit.NoErrAlreadyUpToDate {
-			return nil
-		}
-	}
-
-	return fmt.Errorf("git push: %w\nhint: ensure your SSH agent is running or credentials are configured", err)
+	return nil
 }
 
 // headCommitHash returns the hex hash of HEAD.
-func headCommitHash(repo *gogit.Repository) (string, error) {
-	ref, err := repo.Head()
-	if err != nil {
-		return "", err
-	}
-	return ref.Hash().String(), nil
+func headCommitHash(repoDir string) (string, error) {
+	return runGit(repoDir, "rev-parse", "HEAD")
 }
