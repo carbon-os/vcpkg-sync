@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -16,25 +17,33 @@ func run(cfg Config) error {
 		return err
 	}
 
-	// 2. Read the existing portfile
 	portfilePath := portfileAbs(cfg.RegistryDir, portName)
-	raw, err := os.ReadFile(portfilePath)
-	if err != nil {
-		return fmt.Errorf("read portfile: %w", err)
+
+	// 2. Detect whether this is a first-time bootstrap
+	_, statErr := os.Stat(portfilePath)
+	isNew := os.IsNotExist(statErr)
+	if statErr != nil && !isNew {
+		return fmt.Errorf("stat portfile: %w", statErr)
 	}
-	portfileContent := string(raw)
 
 	// 3. Resolve source URL — flag takes priority, then parse from portfile
 	sourceURL := cfg.SourceURL
-	if sourceURL == "" {
+	if !isNew && sourceURL == "" {
+		raw, err := os.ReadFile(portfilePath)
+		if err != nil {
+			return fmt.Errorf("read portfile: %w", err)
+		}
 		var ok bool
-		sourceURL, ok = extractPortfileURL(portfileContent)
+		sourceURL, ok = extractPortfileURL(string(raw))
 		if !ok {
 			return fmt.Errorf(
 				"cannot parse URL from %s; provide it with -source",
 				portfilePath,
 			)
 		}
+	}
+	if sourceURL == "" {
+		return fmt.Errorf("new port %q: provide upstream URL with -source", portName)
 	}
 
 	// 4. Fetch latest commit from upstream
@@ -45,19 +54,25 @@ func run(cfg Config) error {
 	}
 	fmt.Printf("  ref: %s\n", newRef)
 
-	// 5. Read current version from version manifest
-	versionPath := versionFileAbs(cfg.RegistryDir, portName)
-	var manifest VersionManifest
-	if err := readJSON(versionPath, &manifest); err != nil {
-		return err
-	}
-	if len(manifest.Versions) == 0 {
-		return fmt.Errorf("no versions found in %s", versionPath)
-	}
-	currentVer := manifest.Versions[0].Version
-	newVer, err := bumpPatch(currentVer)
-	if err != nil {
-		return err
+	// 5. Determine old and new version
+	var currentVer, newVer string
+	if isNew {
+		currentVer = "(none)"
+		newVer = "0.0.1"
+	} else {
+		versionPath := versionFileAbs(cfg.RegistryDir, portName)
+		var manifest VersionManifest
+		if err := readJSON(versionPath, &manifest); err != nil {
+			return err
+		}
+		if len(manifest.Versions) == 0 {
+			return fmt.Errorf("no versions found in %s", versionPath)
+		}
+		currentVer = manifest.Versions[0].Version
+		newVer, err = bumpPatch(currentVer)
+		if err != nil {
+			return err
+		}
 	}
 
 	fmt.Printf("→ port:    %s\n", portName)
@@ -78,18 +93,39 @@ func run(cfg Config) error {
 		return err
 	}
 
-	// 7. Update portfile.cmake — only the REF line, everything else preserved
+	// 7. Write port files
 	fmt.Println("→ writing port files")
-	if err := writeText(portfilePath, updatePortfileRef(portfileContent, newRef)); err != nil {
-		return err
+	if isNew {
+		// Create directory tree
+		if err := ensureDir(filepath.Dir(portfilePath)); err != nil {
+			return err
+		}
+		if err := ensureDir(filepath.Dir(versionFileAbs(cfg.RegistryDir, portName))); err != nil {
+			return err
+		}
+
+		// Scaffold portfile.cmake and vcpkg.json from templates
+		if err := writeText(portfilePath, newPortfile(sourceURL, newRef, portName)); err != nil {
+			return err
+		}
+		if err := writeText(vcpkgJSONAbs(cfg.RegistryDir, portName), newVcpkgJSON(portName, newVer)); err != nil {
+			return err
+		}
+	} else {
+		// Update only the REF line; leave everything else intact
+		raw, err := os.ReadFile(portfilePath)
+		if err != nil {
+			return fmt.Errorf("read portfile: %w", err)
+		}
+		if err := writeText(portfilePath, updatePortfileRef(string(raw), newRef)); err != nil {
+			return err
+		}
+		if err := patchJSONField(vcpkgJSONAbs(cfg.RegistryDir, portName), "version", newVer); err != nil {
+			return err
+		}
 	}
 
-	// 8. Update version in vcpkg.json — only the version field, deps preserved
-	if err := patchJSONField(vcpkgJSONAbs(cfg.RegistryDir, portName), "version", newVer); err != nil {
-		return err
-	}
-
-	// 9. Update baseline.json
+	// 8. Update baseline.json
 	var baseline BaselineManifest
 	if err := readJSON(baselineAbs(cfg.RegistryDir), &baseline); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -102,7 +138,7 @@ func run(cfg Config) error {
 		return err
 	}
 
-	// 10. Commit port files + baseline — we derive the tree hash from this commit
+	// 9. Commit port files + baseline — we derive the tree hash from this commit
 	fmt.Println("→ committing port files")
 	portCommit, err := stageAndCommit(
 		repo,
@@ -114,7 +150,7 @@ func run(cfg Config) error {
 		return err
 	}
 
-	// 11. Derive the port directory tree hash from that commit
+	// 10. Derive the port directory tree hash from that commit
 	fmt.Println("→ deriving port tree hash")
 	treeHash, err := subtreeHash(repo, portCommit, portName)
 	if err != nil {
@@ -122,17 +158,23 @@ func run(cfg Config) error {
 	}
 	fmt.Printf("  tree: %s\n", treeHash)
 
-	// 12. Prepend new entry to version manifest
+	// 11. Update version manifest
 	fmt.Println("→ updating version manifest")
+	var manifest VersionManifest
+	if !isNew {
+		if err := readJSON(versionFileAbs(cfg.RegistryDir, portName), &manifest); err != nil {
+			return err
+		}
+	}
 	manifest.Versions = append(
 		[]VersionEntry{{Version: newVer, GitTree: treeHash}},
 		manifest.Versions...,
 	)
-	if err := writeJSON(versionPath, manifest); err != nil {
+	if err := writeJSON(versionFileAbs(cfg.RegistryDir, portName), manifest); err != nil {
 		return err
 	}
 
-	// 13. Commit version manifest separately
+	// 12. Commit version manifest separately
 	if _, err := stageAndCommit(
 		repo,
 		[]string{versionFileRel(portName)},
@@ -142,7 +184,7 @@ func run(cfg Config) error {
 		return err
 	}
 
-	// 14. Push
+	// 13. Push
 	if !cfg.NoPush {
 		fmt.Println("→ pushing")
 		if err := push(repo, cfg.Verbose); err != nil {
@@ -150,12 +192,12 @@ func run(cfg Config) error {
 		}
 	}
 
-	// 15. Print vcpkg-configuration.json snippet
-	baseline2, err := headCommitHash(repo)
+	// 14. Print vcpkg-configuration.json snippet
+	head, err := headCommitHash(repo)
 	if err != nil {
 		return err
 	}
-	printSnippet(sourceURL, portName, baseline2)
+	printSnippet(sourceURL, portName, head)
 
 	return nil
 }
@@ -164,10 +206,19 @@ func resolvePortName(cfg Config) (string, error) {
 	if cfg.Port != "" {
 		return cfg.Port, nil
 	}
+
 	entries, err := os.ReadDir(portsDirAbs(cfg.RegistryDir))
 	if err != nil {
+		if os.IsNotExist(err) {
+			// Registry not yet initialised — derive the port name from the
+			// directory name (e.g. "../fetch" → "fetch").
+			name := filepath.Base(cfg.RegistryDir)
+			fmt.Printf("→ no ports directory found; using %q as port name\n", name)
+			return name, nil
+		}
 		return "", fmt.Errorf("read ports directory: %w", err)
 	}
+
 	var found []string
 	for _, e := range entries {
 		if e.IsDir() {
@@ -176,7 +227,10 @@ func resolvePortName(cfg Config) (string, error) {
 	}
 	switch len(found) {
 	case 0:
-		return "", fmt.Errorf("no ports found in %s", portsDirAbs(cfg.RegistryDir))
+		// Directory exists but is empty — same fallback as above.
+		name := filepath.Base(cfg.RegistryDir)
+		fmt.Printf("→ ports directory is empty; using %q as port name\n", name)
+		return name, nil
 	case 1:
 		fmt.Printf("→ auto-detected port: %s\n", found[0])
 		return found[0], nil

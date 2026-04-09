@@ -53,3 +53,10 @@ func patchJSONField(path, key string, value any) error {
 	raw[key] = encoded
 	return writeJSON(path, raw)
 }
+
+func ensureDir(path string) error {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return fmt.Errorf("create directory %s: %w", path, err)
+	}
+	return nil
+}
