@@ -1,3 +1,4 @@
+// git.go
 package main
 
 import (
@@ -30,13 +31,18 @@ func resolveRemoteHEAD(url string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("git ls-remote %s: %w", url, err)
 	}
-	
+
 	// Output format: <hash>\tHEAD\n
 	fields := strings.Fields(string(out))
 	if len(fields) < 1 {
 		return "", fmt.Errorf("cannot resolve HEAD for %s", url)
 	}
 	return fields[0], nil
+}
+
+// registryRemoteURL returns the fetch URL of the registry's origin remote.
+func registryRemoteURL(repoDir string) (string, error) {
+	return runGit(repoDir, "remote", "get-url", "origin")
 }
 
 // stageAndCommit stages relPaths (relative to repo root) and creates a commit.
@@ -62,7 +68,7 @@ func subtreeHash(repoDir string, commitHash string, portName string) (string, er
 func push(repoDir string, verbose bool) error {
 	cmd := exec.Command("git", "push", "origin")
 	cmd.Dir = repoDir
-	
+
 	if verbose {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr

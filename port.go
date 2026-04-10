@@ -115,6 +115,12 @@ func run(cfg Config) error {
 		}
 	}
 
+	// Ensure vcpkg-cmake host deps are present regardless of how the port was created.
+	fmt.Println("→ ensuring host dependencies")
+	if err := ensureHostDeps(vcpkgJSONAbs(cfg.RegistryDir, portName)); err != nil {
+		return err
+	}
+
 	// 7. Update baseline.json
 	var baseline BaselineManifest
 	if err := readJSON(baselineAbs(cfg.RegistryDir), &baseline); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -180,12 +186,16 @@ func run(cfg Config) error {
 		}
 	}
 
-	// 13. Print vcpkg-configuration.json snippet
+	// 13. Resolve the registry's own remote URL and print the config snippet
+	registryURL, err := registryRemoteURL(cfg.RegistryDir)
+	if err != nil {
+		return err
+	}
 	head, err := headCommitHash(cfg.RegistryDir)
 	if err != nil {
 		return err
 	}
-	printSnippet(sourceURL, portName, head)
+	printSnippet(registryURL, portName, head)
 
 	return nil
 }
@@ -242,11 +252,11 @@ func bumpPatch(v string) (string, error) {
 	return fmt.Sprintf("%s.%s.%d", parts[0], parts[1], patch+1), nil
 }
 
-func printSnippet(repoURL, portName, baseline string) {
+func printSnippet(registryURL, portName, baseline string) {
 	snippet, _ := json.MarshalIndent(map[string]any{
 		"registries": []map[string]any{{
 			"kind":       "git",
-			"repository": repoURL,
+			"repository": registryURL,
 			"baseline":   baseline,
 			"packages":   []string{portName},
 		}},
